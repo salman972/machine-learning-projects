@@ -1,0 +1,754 @@
+data_dir: "C:\\"
+timezone: "UTC"
+sources:
+  my_source:
+    type: stdin
+transforms:
+  my_transform_id:
+    type: remap
+    inputs:
+      - my_source
+    source: |
+      if .log.schema == "raw" { 
+        if exists(.message) && is_json(string!(.message)) {
+          if match(string!(.message), r'filebeat|winlogbeat') {
+            parsed, err = parse_json(string!(.message))
+            if err == null {
+              .event_data = merge(., object!(parsed))
+            }
+          }
+        }
+      }
+      if exists(.message) && is_json(string!(.message)) {
+        .event.original = del(.message)
+        parsed, err = parse_json(string!(.event.original))
+        if err == null {
+          .event_data = object!(parsed)
+        }
+      } else if is_string(.message) {
+          .event.original = del(.message)
+          .event_data = .event.original
+      } else if !exists(.message) {
+          parsed = object(.); del(.); .event = {}
+          .event.original = encode_json(parsed)
+          .event_data = parsed
+      }
+
+          . |= parse_groks!(
+          .event_data,
+          patterns: [
+            "(?:%{SYSLOG_HEADER})?\\s*%{GREEDYDATA:_temp_.full_message}",
+            "%{GREEDYDATA:msg}"
+          ],
+          aliases: {
+          "SYSLOG_HEADER": "(?:%{SYSPRIORITY}\\s*)?(?:%{FTD_DATE:_temp_.raw_date}:?\\s+)?(?:%{PROCESS_HOST}|%{HOST_PROCESS})(?:{DATA})?%{SYSLOG_END}?",
+          "SYSPRIORITY": "<%{INT:log.syslog.priority}>",
+          # Beginning with version 6.3, Firepower Threat Defense provides the option to enable timestamp as per RFC 5424.
+          "FTD_DATE": "(?:%{TIMESTAMP_ISO8601}|%{ASA_DATE})",
+          "ASA_DATE": "(?:%{DAY} )?%{MONTH}  *%{MONTHDAY}(?: %{YEAR})? %{TIME}(?: %{TZ:_temp_.tz})?",
+          "TZ": "(?:[APMCE][SD]T|UTC)",
+          "TIMESTAMP_ISO8601": "%{YEAR}-%{MONTHNUM}-%{MONTHDAY}[T ]%{HOUR}:?%{MINUTE}(?::?%{SECOND})?%{ISO8601_TIMEZONE:_temp_.tz}?",
+          "ISO8601_TIMEZONE": "(?:Z|[+-]%{HOUR}(?::?%{MINUTE}))",
+          "PROCESS": "(?:[^%\\s:\\[]+)",
+          "SYSLOG_END": "(?:(:|\\s)\\s+)",
+          # exactly match the syntax for firepower management logs
+          "PROCESS_HOST": "(?:%{PROCESS:process.name}:\\s%{SYSLOGHOST:host.name})",
+          "HOST_PROCESS": "(?:%{SYSLOGHOST:host.hostname}:?\\s+)?(?:%{PROCESS:process.name}?(?:\\[%{POSINT:process.pid}\\])?)?"
+          }
+        )
+          if !is_null(.log.syslog.priority) {
+            x = to_int!(.log.syslog.priority)
+            .log.syslog.facility = floor(x / 8)
+            .log.syslog.severity = mod(x, 8)
+          }
+        if !is_null(._temp_.full_message) {
+          .gh= parse_groks!(string!(._temp_.full_message),
+            patterns: [
+              "%{FTD_PREFIX}-(?:%{FTD_SUFFIX:_temp_.cisco.suffix}-)?%{NONNEGINT:event.severity}-%{POSINT:_temp_.cisco.message_id}?:?\\s*%{GREEDYDATA:message}",
+              # Before version 6.3, messages for connection, security intelligence, and intrusion events didn't include an event type ID in the message header.
+              "%{GREEDYDATA:message}"
+            ],
+            aliases: {
+            "FTD_SUFFIX": "[^0-9-]+",
+            # Before version 6.3, FTD used ASA prefix in syslog messages
+            "FTD_PREFIX": "%{DATA}%(?:[A-Z]+)",
+            }
+          ) 
+        }
+        if exists(.gh._temp_.cisco.suffix) {._temp_.cisco.suffix = del(.gh._temp_.cisco.suffix)}
+        if exists(.gh.event.severity) {.event.severity = del(.gh.event.severity)}
+        if exists(.gh._temp_.cisco.message_id) {._temp_.cisco.message_id = del(.gh._temp_.cisco.message_id)}
+        if exists(.gh.message) {.message = del(.gh.message)}
+        del(.gh)
+        # Create missing fields when no %FTD label is present
+
+        # message_id is needed in order for some processors below to work.
+        if is_nullish(._temp_.cisco.message_id) {._temp_.cisco.message_id = ""}
+        # set default event.severity to 7 (debug):
+        # This value is read from the EMBLEM header and won't be present if this is not
+        # an emblem message (firewalls can be configured to report other kinds of events)
+        if is_null(.event.severity) {
+          if !exists(.event.severity) {.event.severity = "7" }
+        }
+
+        # Set log.level
+        dictionary =      
+           {
+          "0": "unknown",
+          "1": "alert",
+          "2": "critical",
+          "3": "error",
+          "4": "warning",
+          "5": "notification",
+          "6": "informational",
+          "7": "debug"
+        }
+        #add log.level
+        if exists(.event.severity) {.log.level = get!(dictionary,path:[to_string!(.event.severity)]) }
+
+        # Firewall messages
+        #
+        # This set of messages is shared between FTD and ASA.
+
+        if exists(.message) { .message = replace!(.message,"\r","") }
+        if exists(._temp_.cisco.message_id) {.event.code = ._temp_.cisco.message_id}
+
+        if ._temp_.cisco.message_id == "305012" {
+          . |= parse_groks!(.message,["Teardown %{DATA} %{NOTSPACE:network.transport} translation from %{NOTCOLON:_temp_.cisco.source_interface}:%{IPORHOST:source.address}/%{NUMBER:source.port}(\\s*\\(%{DATA:_temp_.cisco.source_username}\\))? to %{NOTCOLON:_temp_.cisco.destination_interface}:%{IP:destination.address}/%{NUMBER:destination.port} duration %{DURATION:_temp_.duration_hms}%{DATA}",
+                                      "%{GREEDYDATA:_unparsed_data}"],
+            aliases: {
+            "USERNAME": "[^@$]*",
+            "NOTCOLON": "[^:]*",
+            "HOSTNAME": "\\b(?:[0-9A-Za-z][0-9A-Za-z\\-_]{0,62})(?:\\.(?:[0-9A-Za-z][0-9A-Za-z\\-_]{0,62}))*(\\.?|\\b)",
+            "IPORHOST": "(?:%{IP}|%{HOSTNAME})",
+            #CISCO_USER: (?:\*\*\*\*\*|(?:(?:LOCAL\\)?(%{HOSTNAME}\\)?(?:%{USERNAME})\$?(?:@%{HOSTNAME})?(?:, *%{NUMBER})?(?:%{NUMBER}:%{DATA})?))
+            "DURATION": "%{INT}:%{MINUTE}:%{SECOND}"
+            }
+          )
+        }
+        if ._temp_.cisco.message_id == "106001" {
+          . |= parse_groks!(.message,["%{WORD:network_direction} %{WORD:network_transport} connection denied from %{IP:source_address}/%{NUMBER:source_port} to %{IP:destination_address}/%{NUMBER:destination_port} flags %{DATA} on interface %{WORD:_temp_cisco_source_interface}",
+                                      "%{GREEDYDATA:_unparsed_data}"])
+        }
+        if ._temp_.cisco.message_id == "106002" {
+          . |= parse_groks!(.message,["%{WORD:network_transport} Connection denied by %{WORD:network_direction} list %{WORD:_temp_cisco_list_id} src %{IP:source_address} dest %{IP:destination_address}",
+                                      "%{GREEDYDATA:_unparsed_data}"])
+        }
+        if ._temp_.cisco.message_id == "106006" {
+          . |= parse_groks!(.message,["Deny %{WORD:network_direction} %{WORD:network_transport} from %{IP:source_address}/%{NUMBER:source_port} to %{IP:destination_address}/%{NUMBER:destination_port} on interface %{WORD:_temp_cisco_source_interface}",
+                                      "%{GREEDYDATA:_unparsed_data}"])
+        }
+        if ._temp_.cisco.message_id == "106007" {
+          . |= parse_groks!(.message,["Deny %{WORD:network_direction} %{WORD:network_transport} from %{IP:source_address}/%{NUMBER:source_port} to %{IP:destination_address}/%{NUMBER:destination_port} due to %{WORD:network_protocol} %{GREEDYDATA:additional_info}",
+                                      "%{GREEDYDATA:_unparsed_data}"])
+        }
+        if ._temp_.cisco.message_id == "106010" {
+          . |= parse_groks!(.message,["Deny %{NOTSPACE:network.direction} ((protocol %{POSINT:network.iana_number})|%{NOTSPACE:network.transport}) src %{NOTSPACE:_temp_.cisco.source_interface}:%{NOTSPACE:source.address}/%{POSINT:source.port} (%{DATA})?dst %{NOTSPACE:_temp_.cisco.destination_interface}:%{NOTSPACE:destination.address}/%{POSINT:destination.port}(%{GREEDYDATA})?",
+                                      "Deny %{NOTSPACE:network.direction} ((protocol %{POSINT:network.iana_number})|%{NOTSPACE:network.transport}) src %{NOTSPACE:_temp_.cisco.source_interface}:%{NOTSPACE:source.address}(/%{POSINT:source.port})? (%{DATA})?dst %{NOTSPACE:_temp_.cisco.destination_interface}:%{NOTSPACE:destination.address}(/%{POSINT:destination.port})?(%{GREEDYDATA})?",
+                                      "%{GREEDYDATA:_unparsed_data}"])
+        }
+        if ._temp_.cisco.message_id == "106012" {
+          . |= parse_groks!(.message,["Deny IP from %{IP:source_address} to %{IP:destination_address}, %{GREEDYDATA:event_reason}",
+                                      "%{GREEDYDATA:_unparsed_data}"])
+        }
+        if ._temp_.cisco.message_id == "106013" {
+          . |= parse_groks!(.message,["Dropping echo request from %{IP:source_address} to PAT address %{IP:destination_address}%{DATA}",
+                                      "%{GREEDYDATA:_unparsed_data}"])
+
+          if !exists(.network.transport) {.network.transport = "icmp" }
+          if !exists(.network.direction) {.network.direction = "inbound" }
+        }
+        if ._temp_.cisco.message_id == "106014" {
+          . |= parse_groks!(.message,["Deny %{NOTSPACE:network.direction} %{NOTSPACE:network.transport} src %{NOTSPACE:_temp_.cisco.source_interface}:%{NOTSPACE:source.address} (%{DATA})?dst %{NOTSPACE:_temp_.cisco.destination_interface}:(?<destination_address>[^ (]*)(%{GREEDYDATA})?",
+                                      "%{GREEDYDATA:_unparsed_data}"])
+        }
+        if ._temp_.cisco.message_id == "106015" {
+          . |= parse_groks!(.message,["Deny %{NOTSPACE:network.transport} %{NOTSPACE} %{NOTSPACE} from %{IPORHOST:source.address}/%{POSINT:source.port} to %{IPORHOST:destination.address}/%{POSINT:destination.port} flags %{DATA} on interface %{NOTSPACE:_temp_.cisco.source_interface}%{DATA}",
+                                      "%{GREEDYDATA:_unparsed_data}"])
+        }
+        if ._temp_.cisco.message_id == "106016" {
+          . |= parse_groks!(.message,["Deny IP spoof from \\(%{IP:source_address}\\) to %{IP:destination_address} on interface %{WORD:_temp_cisco_source_interface}%{DATA}",
+                                      "%{GREEDYDATA:_unparsed_data}"])
+        }
+        if ._temp_.cisco.message_id == "106017" {
+          . |= parse_groks!(.message,["Deny IP due to Land Attack from %{IP:source_address} to %{IP:destination_address}%{DATA}",
+                                      "%{GREEDYDATA:_unparsed_data}"])
+        }
+        if ._temp_.cisco.message_id == "106018" {
+          . |= parse_groks!(.message,["%{WORD:network_transport} packet type %{WORD:_temp_cisco_icmp_type} denied by %{WORD:network_direction} list %{WORD:_temp_cisco_list_id} src %{IP:source_address} dest %{IP:destination_address}%{DATA}",
+                                      "%{GREEDYDATA:_unparsed_data}"])
+        }
+        if ._temp_.cisco.message_id == "106020" {
+          . |= parse_groks!(.message,["Deny IP teardrop fragment \\(size = %{NUMBER:fragment_size}, offset = %{NUMBER:fragment_offset}\\) from %{IP:source_address} to %{IP:destination_address}%{DATA}",
+                                      "%{GREEDYDATA:_unparsed_data}"])
+        }
+        if ._temp_.cisco.message_id == "106021" {
+          . |= parse_groks!(.message,["Deny %{WORD:network.transport} reverse path check from %{IP:source_address} to %{IP:destination_address} on interface %{WORD:_temp_cisco_source_interface}%{DATA}",
+                                      "%{GREEDYDATA:_unparsed_data}"])
+        }
+        if ._temp_.cisco.message_id == "106022" {
+          . |= parse_groks!(.message,["Deny %{WORD:network_transport} connection spoof from %{IP:source_address} to %{IP:destination_address} on interface %{WORD:_temp_cisco_source_interface}%{DATA}",
+                                      "%{GREEDYDATA:_unparsed_data}"])
+        }
+        if ._temp_.cisco.message_id == "106023" {
+          . |= parse_groks!(.message,["^Deny ((protocol %{POSINT:network.iana_number})|%{NOTSPACE:network.transport}) src %{DATA:_temp_.cisco.source_interface}:%{IPORHOST:source.address}(/%{NUMBER:source.port})?\\s*(\\(%{CISCO_USER_OR_SGT_SRC}\\) )?dst %{DATA:_temp_.cisco.destination_interface}:%{IPORHOST:destination.address}(/%{NUMBER:destination.port})?[(\\s]+%{DATA}by access-group \"%{NOTSPACE:_temp_.cisco.list_id}\"%{DATA}",
+                                      "%{GREEDYDATA:_unparsed_data}"],
+            aliases: {
+            "HOSTNAME": "\\b(?:[0-9A-Za-z][0-9A-Za-z\\-_]{0,62})(?:\\.(?:[0-9A-Za-z][0-9A-Za-z\\-_]{0,62}))*(\\.?|\\b)",
+            "IPORHOST": "(?:%{IP}|%{HOSTNAME})",
+            "USERNAME": "[a-zA-Z0-9._'-]+",
+            "CISCO_USER_OR_SGT_SRC": "(?:%{DATA:_temp_.cisco.source_user_or_sgt}|%{CISCO_SGT:_temp_.cisco.source_user_or_sgt}|\\((?:%{DATA:_temp_.cisco.source_user_or_sgt}|%{CISCO_SGT:_temp_.cisco.source_user_or_sgt})\\))",
+            # "CISCO_USER": "(?:\*\*\*\*\*|(?:(?:LOCAL\\)?(?:%{HOSTNAME}\\)?%{USERNAME}\$?(?:@%{HOSTNAME})?%{CISCO_SGT}?)|[^$]+)",
+            "CISCO_SGT": "(?:, *)?%{NUMBER}(?::%{WORD})?"
+            }
+          )
+        }
+        if ._temp_.cisco.message_id == "106027" {
+          . |= parse_groks!(.message,["%{DATA} Deny src %{IP:source_address} dst %{IP:destination_address} by access-group %{DATA:_temp_cisco_list_id}",
+                                      "%{GREEDYDATA:_unparsed_data}"])
+        }
+        if ._temp_.cisco.message_id == "106100" {
+          . |= parse_groks!(.message,["access-list %{DATA:_temp_cisco_list_id} %{WORD:_temp_outcome} %{WORD:network_transport} %{DATA:_temp_cisco_source_interface}/%{DATA}%{IP:source_address}\\(%{NUMBER:source_port}\\)%{DATA}-> %{WORD:_temp_cisco_destination_interface}/%{IP:destination_address}\\(%{NUMBER:destination_port}\\)%{GREEDYDATA}",
+                                      "%{GREEDYDATA:_unparsed_data}"])
+        }
+        if ._temp_.cisco.message_id == "106102" {
+          . |= parse_groks!(.message,["access-list %{WORD:_temp_cisco_list_id} %{WORD:_temp_outcome} %{WORD:network_transport} for user %{DATA:user_name} %{WORD:_temp_cisco_source_interface}/%{IP:source_address}\\(%{NUMBER:source_port}\\)%{DATA}-> %{WORD:_temp_cisco_destination_interface}/%{IP:destination_address}\\(%{NUMBER:destination_port}\\)%{GREEDYDATA}",
+                                      "%{GREEDYDATA:_unparsed_data}"])
+        }
+        if ._temp_.cisco.message_id == "106103" {
+          . |= parse_groks!(.message,["access-list %{WORD:_temp_cisco_list_id} denied %{WORD:network_transport} for user %{DATA:user_name} %{WORD:_temp_cisco_source_interface}/%{IP:source_address}\\(%{NUMBER:source_port}\\)%{DATA}-> %{WORD:_temp_cisco_destination_interface}/%{IP:destination_address}\\(%{NUMBER:destination_port}\\)%{GREEDYDATA}",
+                                      "%{GREEDYDATA:_unparsed_data}"])
+        }
+        if ._temp_.cisco.message_id == "111004" {
+          . |= parse_groks!(.message,["%{DATA:source_address} end configuration: %{WORD:_temp_outcome}.*",
+                                      "%{GREEDYDATA:_unparsed_data}"])
+        }
+        if ._temp_.cisco.message_id == "111007" {
+          . |= parse_groks!(.message,["Begin configuration: %{IP:source_address} %{GREEDYDATA}",
+                                      "%{GREEDYDATA:_unparsed_data}"])
+        }
+        if ._temp_.cisco.message_id == "111009" {
+          . |= parse_groks!(.message,["^%{NOTSPACE} '%{NOTSPACE:server.user.name}' executed %{NOTSPACE} %{GREEDYDATA:_temp_.cisco.command_line_arguments}",
+                                      "%{GREEDYDATA:_unparsed_data}"])
+        }
+        if ._temp_.cisco.message_id == "111010" {
+          . |= parse_groks!(.message,["User '%{NOTSPACE:server.user.name}', running %{QUOTEDSTRING} from IP %{IP:source.address}, executed %{QUOTEDSTRING:_temp_.cisco.command_line_arguments}%{DATA}",
+                                      "%{GREEDYDATA:_unparsed_data}"])
+        }
+        if ._temp_.cisco.message_id == "113004" {
+          . |= parse_groks!(.message,["AAA user %{DATA:_temp_.cisco.aaa_type} Successful(%{SPACE})?: server =(%{SPACE})?%{IPORHOST:destination.address} [:,] [Uu]ser = %{WORD:source.user.name}%{DATA}",
+                                      "%{GREEDYDATA:_unparsed_data}"],
+            aliases: {
+            "USERNAME": "[a-zA-Z0-9._'-]+"
+            # "CISCO_USER": "(?:\*\*\*\*\*|(?:(?:LOCAL\\)?(?:%{HOSTNAME}\\)?%{USERNAME}\$?(?:@%{HOSTNAME})?%{CISCO_SGT}?)|[^$]+)",
+            }
+          )
+        }
+        if ._temp_.cisco.message_id == "113005" {
+          . |= parse_groks!(.message,["AAA user %{AUTH} Rejected(%{SPACE})?: reason = %{REASON:_temp_.cisco.rejection_reason}(%{SPACE})?: server = %{IPORHOST:destination.address}(%{SPACE})?: user = ?(%{DATA:source.user.name}|)(%{SPACE})?: user IP = %{IPORNONE}%{DATA}",
+                                      "%{GREEDYDATA:_unparsed_data}"],
+            aliases: {
+            "AUTH": "(authentication|authorization)",
+            "REASON": "(AAA failure|Account has been disabled|Invalid password|Password is expiring|Password has expired|Password malformed|Unspecified|Account has been locked out)",
+            "USERNAME": "[a-zA-Z0-9._'-]+",
+            # "CISCO_USER": "(?:\*\*\*\*\*|(?:(?:LOCAL\\)?(?:%{HOSTNAME}\\)?%{USERNAME}\$?(?:@%{HOSTNAME})?%{CISCO_SGT}?)|[^$]+)",
+            "IPORNONE": "(%{IP:source.address}|None)"
+            }
+          )
+        }
+        if ._temp_.cisco.message_id == "113008" {
+          . |= parse_groks!(.message,["AAA transaction status ACCEPT(%{SPACE})?: user = %{WORD:source.user.name}%{DATA}",
+                                      "%{GREEDYDATA:_unparsed_data}"])
+        }
+        if ._temp_.cisco.message_id == "113009" {
+          . |= parse_groks!(.message,["AAA retrieved default group policy %{WORD:_temp_.cisco.group_policy} for user %{USER:source.user.name}%{DATA}",
+                                      "%{GREEDYDATA:_unparsed_data}"])
+        }
+        if ._temp_.cisco.message_id == "113012" {
+          . |= parse_groks!(.message,["AAA user authentication Successful(%{SPACE})?: local database(%{SPACE})?: [Uu]ser = %{USERNAME:source.user.name}%{DATA}",
+                                      "%{GREEDYDATA:_unparsed_data}"],
+            aliases: {
+            "USERNAME": "[a-zA-Z0-9._'-]+"
+            # "CISCO_USER": "(?:\*\*\*\*\*|(?:(?:LOCAL\\)?(?:%{HOSTNAME}\\)?%{USERNAME}\$?(?:@%{HOSTNAME})?%{CISCO_SGT}?)|[^$]+)",
+            }
+          )
+        }
+        if ._temp_.cisco.message_id == "113015" {
+          . |= parse_groks!(.message,["AAA user authentication Rejected(%{SPACE})?: reason = %{REASON:_temp_.cisco.rejection_reason}(%{SPACE})?: local database(%{SPACE})?: [Uu]ser = %{USERNAME:source.user.name}(%{SPACE})?: [Uu]ser IP = %{IP:source.address}%{DATA}",
+                                      "%{GREEDYDATA:_unparsed_data}"],
+            aliases: {
+            "REASON": "(AAA failure|Account has been disabled|Invalid password|Password is expiring|Password has expired|Password malformed|Unspecified|User was not found)",
+            "USERNAME": "[a-zA-Z0-9._'-]+"
+            # "CISCO_USER": "(?:\*\*\*\*\*|(?:(?:LOCAL\\)?(?:%{HOSTNAME}\\)?%{USERNAME}\$?(?:@%{HOSTNAME})?%{CISCO_SGT}?)|[^$]+)",
+            }
+          )
+        }
+        if ._temp_.cisco.message_id == "113019" {
+          . |= parse_groks!(.message,["Group = %{WORD:source.user.group.name}, Username = %{USER:source.user.name}, IP = %{IP:destination.address}, Session disconnected\\. Session Type: %{DATA:_temp_.cisco.session_type}, Duration: %{DATA:_temp_.duration_hms}, Bytes xmt: %{NUMBER:source.bytes}, Bytes rcv: %{NUMBER:destination.bytes}, Reason: %{GREEDYDATA:event.reason}",
+                                      "%{GREEDYDATA:_unparsed_data}"])
+        }
+        if ._temp_.cisco.message_id == "113021" {
+          . |= parse_groks!(.message,["Attempted console login failed. User %{USER:source.user.name} did NOT have appropriate Admin Rights.%{DATA}",
+                                      "%{GREEDYDATA:_unparsed_data}"])
+        }
+        if ._temp_.cisco.message_id == "113022" {
+          . |= parse_groks!(.message,["AAA Marking %{WORD:network.protocol} server %{IP:destination.address} in aaa-server group %{GREEDYDATA}",
+                                      "%{GREEDYDATA:_unparsed_data}"])
+        }
+        if ._temp_.cisco.message_id == "113023" {
+          . |= parse_groks!(.message,["AAA Marking %{WORD:network.protocol} server %{IP:destination.address} in aaa-server group %{GREEDYDATA}",
+                                      "%{GREEDYDATA:_unparsed_data}"])
+        }
+        if ._temp_.cisco.message_id == "113040" {
+          . |= parse_groks!(.message,["Group <%{DATA:source.user.group.name}> User <%{USER:source.user.name}> IP <%{IP:source.address}> Terminating the VPN connection attempt from <%{DATA:_temp_.cisco.tunnel_group}>\\. Reason: This connection is group locked to %{GREEDYDATA:group.locked}\\.",
+                                      "Terminating the VPN connection attempt from %{DATA:_temp_.cisco.tunnel_group}\\. Reason: This connection is group locked to %{GREEDYDATA:group.locked}\\.",
+                                      "Group < %{WORD:source.user.group.name} > User < %{USER:source.user.name} > IP < %{IP:source.address} > Terminating the VPN connection attempt from < %{WORD:_temp_.cisco.tunnel_group} >\\. Reason: This connection is group locked to %{GREEDYDATA:group.locked}\\.",
+                                      "%{GREEDYDATA:_unparsed_data}"])
+        }
+        if includes(["113029","113030","113031","113032","113033","113034","113035","113036","113038","113039"], ._temp_.cisco.message_id) {
+          . |= parse_groks!(.message,["Group <%{DATA:source.user.group.name}> User <%{DATA:source.user.name}> IP <%{IP:source.address}>.*",
+                                      "Group %{NOTSPACE:source.user.group.name} User %{DATA:source.user.name} IP %{IP:source.address}.*",
+                                      "%{GREEDYDATA:_unparsed_data}"])
+        }
+        if ._temp_.cisco.message_id == "302010" {
+          . |= parse_groks!(.message,["%{NUMBER:_temp_.cisco.connections_in_use} in use, %{NUMBER:_temp_.cisco.connections_most_used} most used",
+                                      "%{GREEDYDATA:_unparsed_data}"])
+        }
+        if includes(["302013","302015"], ._temp_.cisco.message_id) {
+          _grk , err = parse_groks(.message,["Built %{NOTSPACE:network.direction} %{GREEDYDATA:_temp_.var_302013_302015}",
+                                      "%{GREEDYDATA:_unparsed_data}"])
+          if err==null{
+          . = merge(., _grk, deep: true)
+          }
+        }
+        if includes(["302013","302015"], ._temp_.cisco.message_id) &&  contains!(.network.direction,"inbound") {
+          _grk , err = parse_groks(._temp_.var_302013_302015,[
+                  "^%{NOTSPACE:network.transport} connection %{NUMBER:_temp_.cisco.connection_id} for %{NOTCOLON:_temp_.cisco.source_interface}:%{IPORHOST:source.address}/%{NUMBER:source.port} \\(%{IPORHOST:_temp_.natsrcip}/%{NUMBER:_temp_.cisco.mapped_source_port}\\)(\\(%{CISCO_USER_OR_SGT_SRC}\\))? to %{NOTCOLON:_temp_.cisco.destination_interface}:%{NOTSPACE:destination.address}/%{NUMBER:destination.port} \\(%{NOTSPACE:_temp_.natdstip}/%{NUMBER:_temp_.cisco.mapped_destination_port}\\)(\\(%{CISCO_USER_OR_SGT_DST}\\))?( \\(%{DATA:_temp_.cisco.termination_user}\\))?%{GREEDYDATA}",
+                  "%{GREEDYDATA:_unparsed_data}"
+                                    ],
+                        aliases: {
+          
+            "IPORHOST": "(?:%{IP}|%{HOSTNAME})",
+            "IP": "(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\\.(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\\.(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\\.(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)",
+            "HOSTNAME": "\\b(?:[0-9A-Za-z][0-9A-Za-z\\-_]{0,62})(?:\\.(?:[0-9A-Za-z][0-9A-Za-z\\-_]{0,62}))*(\\.?|\\b)",
+            "NOTCOLON": "[^:]*",
+            "USERNAME": "[a-zA-Z0-9._'-]+",
+            "CISCO_USER_OR_SGT_SRC": "(?:%{DATA:_temp_.cisco.source_user_or_sgt}|%{CISCO_SGT:_temp_.cisco.source_user_or_sgt}|\\((?:%{DATA:_temp_.cisco.source_user_or_sgt}|%{CISCO_SGT:_temp_.cisco.source_user_or_sgt})\\))",
+            "CISCO_USER_OR_SGT_DST": "(?:%{DATA:_temp_.cisco.destination_user_or_sgt}|%{CISCO_SGT:_temp_.cisco.destination_user_or_sgt}|\\((?:%{DATA:_temp_.cisco.destination_user_or_sgt}|%{CISCO_SGT:_temp_.cisco.destination_user_or_sgt})\\))",
+            #"CISCO_USER": "(?:\\*\\*\\*\\*\\*|(?:(?:LOCAL\\)?(?:%{HOSTNAME}\\)?%{USERNAME}\\$?(?:@%{HOSTNAME})?%{CISCO_SGT}?)|[^$]+)",
+            "CISCO_SGT": "(?:, *)?%{NUMBER}(?::%{WORD})?"
+          }
+          )
+          if err==null{
+          . = merge(., _grk, deep: true)
+          }
+        }
+        if includes(["302013","302015"], ._temp_.cisco.message_id) &&  contains!(.network.direction,"outbound") {
+          _grk , err = parse_groks(._temp_.var_302013_302015,[
+                  "^%{NOTSPACE:network.transport} connection %{NUMBER:_temp_.cisco.connection_id} for %{NOTCOLON:_temp_.cisco.destination_interface}:%{IPORHOST:destination.address}/%{NUMBER:destination.port} \\(%{IPORHOST:_temp_.natdstip}/%{NUMBER:_temp_.cisco.mapped_destination_port}\\)(\\(%{CISCO_USER_OR_SGT_SRC}\\))? to %{NOTCOLON:_temp_.cisco.source_interface}:%{NOTSPACE:source.address}/%{NUMBER:source.port} \\(%{NOTSPACE:_temp_.natsrcip}/%{NUMBER:_temp_.cisco.mapped_source_port}\\)(\\(%{CISCO_USER_OR_SGT_DST}\\))?( \\(%{DATA:_temp_.cisco.termination_user}\\))?%{GREEDYDATA}",
+                  "%{GREEDYDATA:_unparsed_data}"
+                                    ],
+                        aliases: {
+          
+            "IPORHOST": "(?:%{IP}|%{HOSTNAME})",
+            "IP": "(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\\.(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\\.(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\\.(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)",
+            "HOSTNAME": "\\b(?:[0-9A-Za-z][0-9A-Za-z\\-_]{0,62})(?:\\.(?:[0-9A-Za-z][0-9A-Za-z\\-_]{0,62}))*(\\.?|\\b)",
+            "NOTCOLON": "[^:]*",
+            "USERNAME": "[a-zA-Z0-9._'-]+",
+            "CISCO_USER_OR_SGT_SRC": "(?:%{DATA:_temp_.cisco.source_user_or_sgt}|%{CISCO_SGT:_temp_.cisco.source_user_or_sgt}|\\((?:%{DATA:_temp_.cisco.source_user_or_sgt}|%{CISCO_SGT:_temp_.cisco.source_user_or_sgt})\\))",
+            "CISCO_USER_OR_SGT_DST": "(?:%{DATA:_temp_.cisco.destination_user_or_sgt}|%{CISCO_SGT:_temp_.cisco.destination_user_or_sgt}|\\((?:%{DATA:_temp_.cisco.destination_user_or_sgt}|%{CISCO_SGT:_temp_.cisco.destination_user_or_sgt})\\))",
+            #"CISCO_USER": "(?:\\*\\*\\*\\*\\*|(?:(?:LOCAL\\)?(?:%{HOSTNAME}\\)?%{USERNAME}\\$?(?:@%{HOSTNAME})?%{CISCO_SGT}?)|[^$]+)",
+            "CISCO_SGT": "(?:, *)?%{NUMBER}(?::%{WORD})?"
+          }
+          )
+          if err==null{
+          . = merge(., _grk, deep: true)
+          }
+        }
+        if ._temp_.cisco.message_id == "303002" {
+          _grk , err = parse_groks(.message,["%{WORD:network.protocol} connection from %{WORD:_temp_.cisco.source_interface}:%{IP:source.address}/%{NUMBER:source.port} to %{WORD:_temp_.cisco.destination_interface}:%{IP:destination.address}/%{NUMBER:destination.port}, user %{USER:client.user.name} %{GREEDYDATA:extra_data} file %{PATH:file.path}",
+                                      "%{GREEDYDATA:_unparsed_data}"])
+          if err==null{
+          . = merge(., _grk, deep: true)
+          }
+        }
+        if ._temp_.cisco.message_id == "305012" {
+          _grk , err = parse_groks(.message,[
+                  "Teardown %{DATA} %{NOTSPACE:network.transport} translation from %{NOTCOLON:_temp_.cisco.source_interface}:%{IPORHOST:source.address}/%{NUMBER:source.port}(\\s*\\(%{DATA:_temp_.cisco.source_username}\\))? to %{NOTCOLON:_temp_.cisco.destination_interface}:%{IP:destination.address}/%{NUMBER:destination.port} duration %{DURATION:_temp_.duration_hms}",
+                  "%{GREEDYDATA:_unparsed_data}"
+                                    ],
+                        aliases: {
+          
+            "IPORHOST": "(?:%{IP}|%{HOSTNAME})",
+            "HOSTNAME": "\\b(?:[0-9A-Za-z][0-9A-Za-z\\-_]{0,62})(?:\\.(?:[0-9A-Za-z][0-9A-Za-z\\-_]{0,62}))*(\\.?|\\b)",
+            "NOTCOLON": "[^:]*",
+            "USERNAME": "[^@$]*",
+            #"CISCO_USER": "(?:\\*\\*\\*\\*\\*|(?:(?:LOCAL\\)?(?:%{HOSTNAME}\\)?%{USERNAME}\\$?(?:@%{HOSTNAME})?%{CISCO_SGT}?)|[^$]+)",
+            "DURATION": "%{INT}:%{MINUTE}:%{SECOND}"
+          }
+          )
+          if err==null{
+          . = merge(., _grk, deep: true)
+          }
+        }
+        if ._temp_.cisco.message_id == "302020" {
+          _grk , err = parse_groks(.message,[
+                  "Built %{NOTSPACE:network.direction} %{NOTSPACE:network.type} connection for faddr (?:%{NOTCOLON:_temp_.cisco.source_interface}:)?%{ECSDESTIPORHOST}/%{NUMBER}\\s*(?:\\(%{CISCO_USER_OR_SGT_DST}\\) )?gaddr (?:%{NOTCOLON}:)?%{MAPPEDSRC}/%{NUMBER} laddr (?:%{NOTCOLON:_temp_.cisco.source_interface}:)?%{ECSSOURCEIPORHOST}/%{NUMBER}\\s*(?:\\(%{CISCO_USER_OR_SGT_SRC}\\) )?(type %{NUMBER:_temp_.cisco.icmp_type} code %{NUMBER:_temp_.cisco.icmp_code})?",
+                  "%{GREEDYDATA:_unparsed_data}"
+                                    ],
+                        aliases: {
+          
+            "IPORHOST": "(?:%{IP}|%{HOSTNAME})",
+            "HOSTNAME": "\\b(?:[0-9A-Za-z][0-9A-Za-z\\-_]{0,62})(?:\\.(?:[0-9A-Za-z][0-9A-Za-z\\-_]{0,62}))*(\\.?|\\b)",
+            "NOTCOLON": "[^:]*",
+            "ECSSOURCEIPORHOST": "(?:%{IP:source.address}|%{HOSTNAME:source.domain})",
+            "ECSDESTIPORHOST": "(?:%{IP:destination.address}|%{HOSTNAME:destination.domain})",
+            "MAPPEDSRC": "(?:%{DATA:_temp_.natsrcip}|%{HOSTNAME})",
+            "USERNAME": "[a-zA-Z0-9._'-]+",
+            "CISCO_USER_OR_SGT_SRC": "(?:%{DATA:_temp_.cisco.source_user_or_sgt}|%{CISCO_SGT:_temp_.cisco.source_user_or_sgt}|\\((?:%{DATA:_temp_.cisco.source_user_or_sgt}|%{CISCO_SGT:_temp_.cisco.source_user_or_sgt})\\))",
+            "CISCO_USER_OR_SGT_DST": "(?:%{DATA:_temp_.cisco.destination_user_or_sgt}|%{CISCO_SGT:_temp_.cisco.destination_user_or_sgt}|\\((?:%{DATA:_temp_.cisco.destination_user_or_sgt}|%{CISCO_SGT:_temp_.cisco.destination_user_or_sgt})\\))",
+            #"CISCO_USER": "(?:\\*\\*\\*\\*\\*|(?:(?:LOCAL\\)?(?:%{HOSTNAME}\\)?%{USERNAME}\\$?(?:@%{HOSTNAME})?%{CISCO_SGT}?)|[^$]+)",
+            "CISCO_SGT": "(?:, *)?%{NUMBER}(?::%{WORD})?"
+          }
+          )
+          if err==null{
+          . = merge(., _grk, deep: true)
+          }
+        }
+        if ._temp_.cisco.message_id == "302022" {
+          _grk , err = parse_groks(.message,["Built %{DATA} stub %{WORD:network.transport} connection for %{WORD:_temp_.cisco.source_interface}:%{IP:source.address}/%{NUMBER:source.port} %{DATA} to %{WORD:_temp_.cisco.destination_interface}:%{IP:destination.address}/%{NUMBER:destination.port} %{GREEDYDATA}",
+                                      "%{GREEDYDATA:_unparsed_data}"])
+          if err==null{
+          . = merge(., _grk, deep: true)
+          }
+        }
+        if ._temp_.cisco.message_id == "302023" {
+          _grk , err = parse_groks(.message,["Teardown stub %{WORD:network.transport} connection for %{WORD:_temp_.cisco.source_interface}:%{IP:source.address}/%{NUMBER:source.port} to %{WORD:_temp_.cisco.destination_interface}:%{IP:destination.address}/%{NUMBER:destination.port} duration %{DATA:_temp_.duration_hms} forwarded bytes %{NUMBER:network.bytes} %{GREEDYDATA:event.reason}",
+                                      "%{GREEDYDATA:_unparsed_data}"])
+          if err==null{
+          . = merge(., _grk, deep: true)
+          }
+        }
+        if ._temp_.cisco.message_id == "304001" {
+          _grk , err = parse_groks(.message,["(%{NOTSPACE:source.user.name}@)?%{IP:source.address}(\\(%{DATA}\\))? %{DATA} (%{NOTSPACE}@)?%{IPORHOST:destination.address}:%{GREEDYDATA:url.original}",
+                                      "%{GREEDYDATA:_unparsed_data}"])
+          if err==null{
+          . = merge(., _grk, deep: true)
+          }
+        }
+        if ._temp_.cisco.message_id == "304002" {
+          _grk , err = parse_groks(.message,["Access denied URL %{DATA:url.original} SRC %{IPORHOST:source_address} %{DATA}EST %{IPORHOST:destination.address} on interface %{WORD:_temp_cisco_source_interface}%{DATA}",
+                                      "%{GREEDYDATA:_unparsed_data}"])
+          if err==null{
+          . = merge(., _grk, deep: true)
+          }
+        }
+        if ._temp_.cisco.message_id == "305011" {
+          _grk , err = parse_groks(.message,["Built %{NOTSPACE} %{NOTSPACE:network_transport} translation from %{NOTSPACE:_temp_cisco_source_interface}:%{IPORHOST:source_address}/%{NUMBER:source_port}(\\(%{NOTSPACE:source.user.name}\\))? to %{NOTSPACE:_temp_cisco_destination_interface}:%{IP:destination_address}/%{NUMBER:destination_port}.*",
+                                      "%{GREEDYDATA:_unparsed_data}"])
+          if err==null{
+          . = merge(., _grk, deep: true)
+          }
+        }
+        if ._temp_.cisco.message_id == "313001" {
+          _grk , err = parse_groks(.message,["Denied %{WORD:network.transport} type=%{WORD:_temp_.cisco.icmp_type}, code=%{WORD:_temp_.cisco.icmp_code} from %{IP:source.address} on interface %{WORD:_temp_.cisco.source_interface}.*",
+                                      "%{GREEDYDATA:_unparsed_data}"])
+          if err==null{
+          . = merge(., _grk, deep: true)
+          }
+        }
+        if ._temp_.cisco.message_id == "313004" {
+          _grk , err = parse_groks(.message,["Denied %{WORD:network.transport} type=%{WORD:_temp_.cisco.icmp_type}, from%{DATA}addr %{IP:source.address} on interface %{WORD:_temp_.cisco.source_interface} to %{IP:destination.address}: no matching session.*",
+                                      "%{GREEDYDATA:_unparsed_data}"])
+          if err==null{
+          . = merge(., _grk, deep: true)
+          }
+        }
+        if ._temp_.cisco.message_id == "313005" {
+          _grk , err = parse_groks(.message,["No matching connection for ICMP error message: %{NOTSPACE:network.transport} src %{NOTCOLON:_temp_.cisco.source_interface}:%{IPORHOST} dst %{NOTCOLON:_temp_.cisco.destination_interface}:%{IPORHOST} \\(type %{NUMBER:_temp_.cisco.icmp_type}, code %{NUMBER:_temp_.cisco.icmp_code}\\) on %{NOTCOLON} interface.%{SPACE}Original IP payload: %{NOTSPACE:input.type} src %{IPORHOST:source.address}(/%{NUMBER:source.port})? dst %{IPORHOST:destination.address}(/%{NUMBER:destination.port})?[.]?.*",
+                                      "No matching connection for ICMP error message: %{NOTSPACE:network.transport} src %{NOTCOLON:_temp_.cisco.source_interface}:%{IPORHOST} dst %{NOTCOLON:_temp_.cisco.destination_interface}:%{IPORHOST} \\(type %{NUMBER:_temp_.cisco.icmp_type}, code %{NUMBER:_temp_.cisco.icmp_code}\\) on %{NOTCOLON} interface.%{SPACE}Original IP payload: protocol %{NUMBER:_temp_.cisco.original_iana_number} src %{IPORHOST:source.address}(/%{NUMBER:source.port})? dst %{IPORHOST:destination.address}(/%{NUMBER:destination.port})?[.]?.*",
+                                      "No matching connection for ICMP error message: %{NOTSPACE:network.transport} src %{NOTCOLON:_temp_.cisco.source_interface}:%{IPORHOST}\\(%{NOTCOLON:source.user.domain}\\\\%{NOTSPACE:source.user.group.name}\\\\%{NOTSPACE:source.user.name}\\) dst %{NOTCOLON:_temp_.cisco.destination_interface}:%{IPORHOST} \\(type %{NUMBER:_temp_.cisco.icmp_type}, code %{NUMBER:_temp_.cisco.icmp_code}\\) on %{NOTCOLON} interface.%{SPACE}Original IP payload: %{NOTSPACE:input.type} src %{IPORHOST:source.address}(/%{NUMBER:source.port})? dst %{IPORHOST:destination.address}(/%{NUMBER:destination.port})?[.]?.*",
+                                      "No matching connection for ICMP error message: %{NOTSPACE:network.transport} src %{NOTCOLON:_temp_.cisco.source_interface}:%{IPORHOST}\\(%{NOTCOLON:source.user.domain}\\\\%{NOTSPACE:source.user.name}\\) dst %{NOTCOLON:_temp_.cisco.destination_interface}:%{IPORHOST} \\(type %{NUMBER:_temp_.cisco.icmp_type}, code %{NUMBER:_temp_.cisco.icmp_code}\\) on %{NOTCOLON} interface.%{SPACE}Original IP payload: %{NOTSPACE:input.type} src %{IPORHOST:source.address}(/%{NUMBER:source.port})? dst %{IPORHOST:destination.address}(/%{NUMBER:destination.port})?[.]?.*",
+                                      "No matching connection for ICMP error message: %{NOTSPACE:network.transport} src %{NOTCOLON:_temp_.cisco.source_interface}:%{IPORHOST}(\\(%{CISCO_USER_OR_SGT_SRC}\\))? dst %{NOTCOLON:_temp_.cisco.destination_interface}:%{IPORHOST}(\\(%{CISCO_USER_OR_SGT_DST}\\))? \\(type %{NUMBER:_temp_.cisco.icmp_type}, code %{NUMBER:_temp_.cisco.icmp_code}\\) on %{NOTCOLON} interface.%{SPACE}Original IP payload: %{NOTSPACE:input.type} src %{IPORHOST:source.address}(/%{NUMBER:source.port})? dst %{IPORHOST:destination.address}(/%{NUMBER:destination.port})?[.]?.*",
+                                      "No matching connection for ICMP error message: %{NOTSPACE:network.transport} src %{NOTCOLON:_temp_.cisco.source_interface}:%{IPORHOST} dst %{NOTCOLON:_temp_.cisco.destination_interface}:%{IPORHOST} \\(type %{NUMBER:_temp_.cisco.icmp_type}, code %{NUMBER:_temp_.cisco.icmp_code}\\) on %{NOTCOLON} interface.%{SPACE}Original IP payload: <unknown>[.]?.*",
+                                      "%{GREEDYDATA:_unparsed_data}"],
+            aliases: {
+            "DURATION": "%{INT}:%{MINUTE}:%{SECOND}",
+            "NOTCOLON" : "[^:]*",
+            "HOSTNAME" : "\\b(?:[0-9A-Za-z][0-9A-Za-z\\-_]{0,62})(?:\\.(?:[0-9A-Za-z][0-9A-Za-z\\-_]{0,62}))*(\\.?|\\b)",
+            "IPORHOST" : "(?:%{IP}|%{HOSTNAME})",
+            "USERNAME" : "[a-zA-Z0-9._'-]+",
+            "CISCO_USER_OR_SGT_SRC" : "(?:%{DATA:_temp_.cisco.source_user_or_sgt}|%{CISCO_SGT:_temp_.cisco.source_user_or_sgt}|\\((?:%{DATA:_temp_.cisco.source_user_or_sgt}|%{CISCO_SGT:_temp_.cisco.source_user_or_sgt})\\))",
+            "CISCO_USER_OR_SGT_DST" : "(?:%{DATA:_temp_.cisco.destination_user_or_sgt}|%{CISCO_SGT:_temp_.cisco.destination_user_or_sgt}|\\((?:%{DATA:_temp_.cisco.destination_user_or_sgt}|%{CISCO_SGT:_temp_.cisco.destination_user_or_sgt})\\))",
+            # "CISCO_USER" : "(?:\\*\\*\\*\\*\\*|(?:(?:LOCAL\\)?(?:%{HOSTNAME}\\)?%{USERNAME}\\$?(?:@%{HOSTNAME})?%{CISCO_SGT}?)|[^$]+)",
+            "CISCO_SGT" : "(?:, *)?%{NUMBER}(?::%{WORD})?"
+            }
+          )
+        if err==null{
+          . = merge(., _grk, deep: true)
+        }
+        }
+        if ._temp_.cisco.message_id == "313008" {
+          _grk , err = parse_groks(.message,["Denied %{DATA:network.transport} type=%{WORD:_temp_.cisco.icmp_type}, code=%{WORD:_temp_.cisco.icmp_code} from %{IP:source.address} on interface %{WORD:_temp_.cisco.source_interface}%{DATA}",
+                                      "%{GREEDYDATA:_unparsed_data}"])
+          if err==null{
+          . = merge(., _grk, deep: true)
+          }
+        }
+        if ._temp_.cisco.message_id == "313009" {
+          _grk , err = parse_groks(.message,["Denied invalid %{DATA:network.transport} code %{WORD:_temp_.cisco.icmp_code}, for %{WORD:_temp_.cisco.source_interface}:%{IP:source.address}/%{NUMBER:source.port} \\(%{IP:_temp_.natsrcip}/%{NUMBER:_temp_.cisco.mapped_source_port}\\) to %{WORD:_temp_.cisco.destination_interface}:%{IP:destination.address}/%{NUMBER:destination.port} \\(%{IP:_temp_.natdstip}/%{NUMBER:_temp_.cisco.mapped_destination_port}\\)%{GREEDYDATA}",
+                                      "%{GREEDYDATA:_unparsed_data}"])
+        if err==null{
+          . = merge(., _grk, deep: true)
+        }
+        }
+        if ._temp_.cisco.message_id == "315011" {
+          _grk , err = parse_groks(.message,["SSH session from %{IP:source.ip} on interface %{WORD:_temp_.cisco.source_interface} for user %{DATA:source.user.name} disconnected by SSH server, reason: %{DATA:event.reason}.*",
+                                      "%{GREEDYDATA:_unparsed_data}"])
+          if err==null{
+          . = merge(., _grk, deep: true)
+          }
+        }
+        if ._temp_.cisco.message_id == "322001" {
+          _grk , err = parse_groks(.message,["Deny MAC address %{MAC:source.mac}, possible spoof attempt on interface %{WORD:_temp_.cisco.source_interface}.*",
+                                      "%{GREEDYDATA:_unparsed_data}"])
+          if err==null{
+          . = merge(., _grk, deep: true)
+          }
+        }
+        if ._temp_.cisco.message_id == "338001" {
+          _grk , err = parse_groks(.message,["Dynamic filter %{DATA} black%{DATA}d %{DATA:network.transport} traffic from %{WORD:_temp_.cisco.source_interface}:%{IP:source.address}/%{NUMBER:source.port} \\(%{IP:_temp_.natsrcip}/%{NUMBER:_temp_.cisco.mapped_source_port}\\) to %{WORD:_temp_.cisco.destination_interface}:%{IP:destination.address}/%{NUMBER:destination.port} \\(%{IP:_temp_.natdstip}/%{NUMBER:_temp_.cisco.mapped_destination_port}\\)%{DATA}source %{DATA} resolved from %{WORD:_temp_.cisco.list_id} list: %{DATA:source.domain}, threat-level: %{WORD:_temp_.cisco.threat_level}, category: %{WORD:_temp_.cisco.threat_category}.*",
+                                      "%{GREEDYDATA:_unparsed_data}"])
+          if err==null{
+          . = merge(., _grk, deep: true)
+          }
+          if exists(.source.domain){
+            .server.domain = .source.domain
+          }
+        }
+        if ._temp_.cisco.message_id == "338002" {
+          _grk , err = parse_groks(.message,["Dynamic %{DATA}ilter %{DATA} black%{DATA}d %{WORD:network.transport} traffic from %{WORD:_temp_.cisco.source_interface}:%{IP:source.address}/%{NUMBER:source.port} \\(%{IP:_temp_.natsrcip}/%{NUMBER:_temp_.cisco.mapped_source_port}\\) to %{WORD:_temp_.cisco.destination_interface}:%{IP:destination.address}/%{NUMBER:destination.port} \\(%{IP:_temp_.natdstip}/%{NUMBER:_temp_.cisco.mapped_destination_port}\\)%{DATA}destination %{DATA} resolved from %{WORD:_temp_.cisco.list_id} list: %{HOSTNAME:destination.domain}%{DATA}",
+                                      "%{GREEDYDATA:_unparsed_data}"])
+          if err==null{
+          . = merge(., _grk, deep: true)
+          }
+          if exists(.destination.domain){
+            .server.domain = .destination.domain
+          }
+        }
+        if ._temp_.cisco.message_id == "338003" {
+          _grk , err = parse_groks(.message, [
+            "Dynamic %{DATA}ilter %{DATA} black%{DATA}d %{WORD:network.transport} traffic from %{WORD:_temp_.cisco.source_interface}:%{IP:source.address}/%{NUMBER:source.port} \\(%{IP:_temp_.natsrcip}/%{NUMBER:_temp_.cisco.mapped_source_port}\\) to %{WORD:_temp_.cisco.destination_interface}:%{IP:destination.address}/%{NUMBER:destination.port} \\(%{IP:_temp_.natdstip}/%{NUMBER:_temp_.cisco.mapped_destination_port}\\)%{DATA}source %{DATA} resolved from %{WORD:_temp_.cisco.list_id} list: %{DATA}, threat-level: %{WORD:_temp_.cisco.threat_level}, category: %{WORD:_temp_.cisco.threat_category}%{DATA}",
+            "%{GREEDYDATA:_unparsed_data}"
+          ])
+          if err==null{
+          . = merge(., _grk, deep: true)
+          }
+        }
+ 
+        if ._temp_.cisco.message_id == "338004" {
+          _grk , err = parse_groks(.message, [
+            "Dynamic %{DATA}ilter %{DATA} black%{DATA}d %{WORD:network.transport} traffic from %{WORD:_temp_.cisco.source_interface}:%{IP:source.address}/%{NUMBER:source.port} \\(%{IP:_temp_.natsrcip}/%{NUMBER:_temp_.cisco.mapped_source_port}\\) to %{WORD:_temp_.cisco.destination_interface}:%{IP:destination.address}/%{NUMBER:destination.port} \\(%{IP:_temp_.natdstip}/%{NUMBER:_temp_.cisco.mapped_destination_port}\\)%{DATA}destination %{DATA} resolved from %{WORD:_temp_.cisco.list_id} list: %{DATA}, threat-level: %{DATA:_temp_.cisco.threat_level}, category: %{WORD:_temp_.cisco.threat_category}%{DATA}",
+            "%{GREEDYDATA:_unparsed_data}"
+          ])
+          if err==null{
+          . = merge(., _grk, deep: true)
+          }
+        }
+ 
+        if ._temp_.cisco.message_id == "338005" {
+          _grk , err = parse_groks(.message, [
+            "Dynamic %{DATA}ilter %{DATA} black%{DATA}d %{WORD:network.transport} traffic from %{WORD:_temp_.cisco.source_interface}:%{IP:source.address}/%{NUMBER:source.port} \\(%{IP:_temp_.natsrcip}/%{NUMBER:_temp_.cisco.mapped_source_port}\\) to %{WORD:_temp_.cisco.destination_interface}:%{IP:destination.address}/%{NUMBER:destination.port} \\(%{IP:_temp_.natdstip}/%{NUMBER:_temp_.cisco.mapped_destination_port}\\)%{DATA}source %{DATA} resolved from %{WORD:_temp_.cisco.list_id} list: %{DATA:source.domain}, threat-level: %{DATA:_temp_.cisco.threat_level}, category: %{WORD:_temp_.cisco.threat_category}%{DATA}",
+            "%{GREEDYDATA:_unparsed_data}"
+          ])
+          if err==null{
+          . = merge(., _grk, deep: true)
+          }
+          if exists(.source.domain){
+            .server.domain = .source.domain
+          }
+        }
+        if ._temp_.cisco.message_id == "338006" {
+          _grk , err = parse_groks(.message,["Dynamic %{DATA}ilter %{DATA} black%{DATA}d %{WORD:network.transport} traffic from %{WORD:_temp_.cisco.source_interface}:%{IP:source.address}/%{NUMBER:source.port} \\(%{IP:_temp_.natsrcip}/%{NUMBER:_temp_.cisco.mapped_source_port}\\) to %{WORD:_temp_.cisco.destination_interface}:%{IP:destination.address}/%{NUMBER:destination.port} \\(%{IP:_temp_.natdstip}/%{NUMBER:_temp_.cisco.mapped_destination_port}\\)%{DATA}destination %{DATA} resolved from %{WORD:_temp_.cisco.list_id} list: %{DATA:destination.domain}, threat-level: %{DATA:_temp_.cisco.threat_level}, category: %{WORD:_temp_.cisco.threat_category}",
+                                      "%{GREEDYDATA:_unparsed_data}"])
+          if err==null{
+          . = merge(., _grk, deep: true)
+          }
+          if exists(.destination.domain){
+            .server.domain = .destination.domain
+          }
+        }
+        if ._temp_.cisco.message_id == "338007" {
+          _grk , err = parse_groks(.message, [
+            "Dynamic %{DATA}ilter %{DATA} black%{DATA}d %{WORD:network.transport} traffic from %{WORD:_temp_.cisco.source_interface}:%{IP:source.address}/%{NUMBER:source.port} \\(%{IP:_temp_.natsrcip}/%{NUMBER:_temp_.cisco.mapped_source_port}\\) to %{WORD:_temp_.cisco.destination_interface}:%{IP:destination.address}/%{NUMBER:destination.port} \\(%{IP:_temp_.natdstip}/%{NUMBER:_temp_.cisco.mapped_destination_port}\\)%{DATA}source %{DATA} resolved from %{WORD:_temp_.cisco.list_id} list: %{DATA}, threat-level: %{DATA:_temp_.cisco.threat_level}, category: %{WORD:_temp_.cisco.threat_category}",
+            "%{GREEDYDATA:_unparsed_data}"
+          ])
+          if err==null{
+          . = merge(., _grk, deep: true)
+          }
+        }
+        if ._temp_.cisco.message_id == "338008" {
+          _grk , err = parse_groks(.message, [
+            "Dynamic %{DATA}ilter %{DATA} black%{DATA}d %{WORD:network.transport} traffic from %{WORD:_temp_.cisco.source_interface}:%{IP:source.address}/%{NUMBER:source.port} \\(%{IP:_temp_.natsrcip}/%{NUMBER:_temp_.cisco.mapped_source_port}\\) to %{WORD:_temp_.cisco.destination_interface}:%{IP:destination.address}/%{NUMBER:destination.port} \\(%{IP:_temp_.natdstip}/%{NUMBER:_temp_.cisco.mapped_destination_port}\\)%{DATA}destination %{DATA} resolved from %{WORD:_temp_.cisco.list_id} list: %{DATA}, threat-level: %{DATA:_temp_.cisco.threat_level}, category: %{WORD:_temp_.cisco.threat_category}",
+            "%{GREEDYDATA:_unparsed_data}"
+          ])
+          if err==null{
+          . = merge(., _grk, deep: true)
+          }
+        }
+        if ._temp_.cisco.message_id == "338102" {
+          _grk , err = parse_groks(.message, [
+            "Dynamic %{DATA}ilter %{DATA} white%{DATA}d %{WORD:network.transport} traffic from %{WORD:_temp_.cisco.source_interface}:%{IP:source.address}/%{NUMBER:source.port} \\(%{IP:_temp_.natsrcip}/%{NUMBER:_temp_.cisco.mapped_source_port}\\) to %{WORD:_temp_.cisco.destination_interface}:%{IP:destination.address}/%{NUMBER:destination.port} \\(%{IP:_temp_.natdstip}/%{NUMBER:_temp_.cisco.mapped_destination_port}\\)%{DATA}destination %{DATA} resolved from %{WORD:_temp_.cisco.list_id} list: %{DATA:destination.domain}",
+            "%{GREEDYDATA:_unparsed_data}"
+          ])
+          if err==null{
+          . = merge(., _grk, deep: true)
+          }
+          if exists(.destination.domain){
+            .server.domain = .destination.domain
+          }
+        }
+        if ._temp_.cisco.message_id == "338103" {
+          _grk , err = parse_groks(.message, [
+            "Dynamic %{DATA}ilter %{DATA} white%{DATA}d %{WORD:network.transport} traffic from %{WORD:_temp_.cisco.source_interface}:%{IP:source.address}/%{NUMBER:source.port} \\(%{IP:_temp_.natsrcip}/%{NUMBER:_temp_.cisco.mapped_source_port}\\) to %{WORD:_temp_.cisco.destination_interface}:%{IP:destination.address}/%{NUMBER:destination.port} \\(%{IP:_temp_.natdstip}/%{NUMBER:_temp_.cisco.mapped_destination_port}\\)%{DATA}source %{DATA} resolved from %{WORD:_temp_.cisco.list_id} list: %{DATA}",
+            "%{GREEDYDATA:_unparsed_data}"
+          ])
+          if err==null{
+          . = merge(., _grk, deep: true)
+          }
+        }
+        if ._temp_.cisco.message_id == "338104" {
+          _grk , err = parse_groks(.message, [
+            "Dynamic %{DATA}ilter %{DATA} white%{DATA}d %{WORD:network.transport} traffic from %{WORD:_temp_.cisco.source_interface}:%{IP:source.address}/%{NUMBER:source.port} \\(%{IP:_temp_.natsrcip}/%{NUMBER:_temp_.cisco.mapped_source_port}\\) to %{WORD:_temp_.cisco.destination_interface}:%{IP:destination.address}/%{NUMBER:destination.port} \\(%{IP:_temp_.natdstip}/%{NUMBER:_temp_.cisco.mapped_destination_port}\\)%{DATA}destination %{DATA} resolved from %{WORD:_temp_.cisco.list_id} list: %{DATA}",
+            "%{GREEDYDATA:_unparsed_data}"
+          ])
+          if err==null{
+          . = merge(., _grk, deep: true)
+          }
+        }
+        if ._temp_.cisco.message_id == "338201" {
+          _grk , err = parse_groks(.message, [
+            "Dynamic %{DATA}ilter %{DATA} grey%{DATA}d %{WORD:network.transport} traffic from %{WORD:_temp_.cisco.source_interface}:%{IP:source.address}/%{NUMBER:source.port} \\(%{IP:_temp_.natsrcip}/%{NUMBER:_temp_.cisco.mapped_source_port}\\) to %{WORD:_temp_.cisco.destination_interface}:%{IP:destination.address}/%{NUMBER:destination.port} \\(%{IP:_temp_.natdstip}/%{NUMBER:_temp_.cisco.mapped_destination_port}\\)%{DATA}source %{DATA} resolved from %{WORD:_temp_.cisco.list_id} list: %{DATA:source.domain}, threat-level: %{DATA:_temp_.cisco.threat_level}, category: %{WORD:_temp_.cisco.threat_category}",
+            "%{GREEDYDATA:_unparsed_data}"
+          ])
+          if err==null{
+          . = merge(., _grk, deep: true)
+          }
+          if exists(.source.domain){
+            .server.domain = .source.domain
+          }
+        }
+        if ._temp_.cisco.message_id == "338202" {
+          _grk , err = parse_groks(.message, [
+            "Dynamic %{DATA}ilter %{DATA} grey%{DATA}d %{WORD:network.transport} traffic from %{WORD:_temp_.cisco.source_interface}:%{IP:source.address}/%{NUMBER:source.port} \\(%{IP:_temp_.natsrcip}/%{NUMBER:_temp_.cisco.mapped_source_port}\\) to %{WORD:_temp_.cisco.destination_interface}:%{IP:destination.address}/%{NUMBER:destination.port} \\(%{IP:_temp_.natdstip}/%{NUMBER:_temp_.cisco.mapped_destination_port}\\)%{DATA}destination %{DATA} resolved from %{WORD:_temp_.cisco.list_id} list: %{DATA:destination.domain}, threat-level: %{DATA:_temp_.cisco.threat_level}, category: %{WORD:_temp_.cisco.threat_category}",
+            "%{GREEDYDATA:_unparsed_data}"
+          ])
+          if err==null{
+          . = merge(., _grk, deep: true)
+          }
+          if exists(.destination.domain){
+            .server.domain = .destination.domain
+          }
+        }
+        if ._temp_.cisco.message_id == "338203" {
+          _grk , err = parse_groks(.message, [
+            "Dynamic %{DATA}ilter %{DATA} grey%{DATA}d %{WORD:network.transport} traffic from %{WORD:_temp_.cisco.source_interface}:%{IP:source.address}/%{NUMBER:source.port} \\(%{IP:_temp_.natsrcip}/%{NUMBER:_temp_.cisco.mapped_source_port}\\) to %{WORD:_temp_.cisco.destination_interface}:%{IP:destination.address}/%{NUMBER:destination.port} \\(%{IP:_temp_.natdstip}/%{NUMBER:_temp_.cisco.mapped_destination_port}\\)%{DATA}source %{DATA} resolved from %{WORD:_temp_.cisco.list_id} list: %{DATA:source.domain}, threat-level: %{DATA:_temp_.cisco.threat_level}, category: %{WORD:_temp_.cisco.threat_category}",
+            "%{GREEDYDATA:_unparsed_data}"
+          ])
+          if err==null{
+          . = merge(., _grk, deep: true)
+          }
+          if exists(.source.domain){
+            .server.domain = .source.domain
+          }
+        }
+        if ._temp_.cisco.message_id == "338204" {
+          _grk , err = parse_groks(.message, [
+            "Dynamic %{DATA}ilter %{DATA} grey%{DATA}d %{WORD:network.transport} traffic from %{WORD:_temp_.cisco.source_interface}:%{IP:source.address}/%{NUMBER:source.port} \\(%{IP:_temp_.natsrcip}/%{NUMBER:_temp_.cisco.mapped_source_port}\\) to %{WORD:_temp_.cisco.destination_interface}:%{IP:destination.address}/%{NUMBER:destination.port} \\(%{IP:_temp_.natdstip}/%{NUMBER:_temp_.cisco.mapped_destination_port}\\)%{DATA}destination %{DATA} resolved from %{WORD:_temp_.cisco.list_id} list: %{DATA:destination.domain}, threat-level: %{DATA:_temp_.cisco.threat_level}, category: %{WORD:_temp_.cisco.threat_category}",
+            "%{GREEDYDATA:_unparsed_data}"
+          ])
+          if err==null{
+          . = merge(., _grk, deep: true)
+          }
+          if exists(.destination.domain){
+            .server.domain = .destination.domain
+          }
+        }
+        if ._temp_.cisco.message_id == "338301" {
+          _grk , err = parse_groks(.message, [
+            "Intercepted DNS reply for domain %{DATA:source.domain} from %{WORD:_temp_.cisco.source_interface}:%{IP:source.address}/%{NUMBER:source.port} to %{WORD:_temp_.cisco.destination_interface}:%{IP:destination.address}/%{NUMBER:destination.port}, matched %{WORD:_temp_.cisco.list_id}",
+            "%{GREEDYDATA:_unparsed_data}"
+          ])
+          if err==null{
+          . = merge(., _grk, deep: true)
+          }
+          if exists(.destination.address){
+            .client.address = .destination.address
+          }
+          if exists(.destination.port){
+            .client.port = .destination.port
+          }
+          if exists(.source.address){
+            .server.address = .source.address
+          }
+          if exists(.source.port){
+            .server.port = .source.port
+          }
+        }
+        if ._temp_.cisco.message_id == "502103" {
+          _grk , err = parse_groks(.message, [
+            "User priv level changed: Uname: %{WORD:server.user.name} From: %{NUMBER:_temp_.cisco.privilege.old} To: %{NUMBER:_temp_.cisco.privilege.new}",
+            "%{GREEDYDATA:_unparsed_data}"
+          ])
+          if err==null{
+          . = merge(., _grk, deep: true)
+          }
+        }
+        if ._temp_.cisco.message_id == "507003" {
+          _grk , err = parse_groks(.message, [
+            "%{WORD:network.transport} flow from %{WORD:_temp_.cisco.source_interface}:%{IP:source.address}/%{NUMBER:source.port} to %{WORD:_temp_.cisco.destination_interface}:%{IP:destination.address}/%{NUMBER:destination.port} terminated by inspection engine, reason - %{GREEDYDATA:message}",
+            "%{GREEDYDATA:_unparsed_data}"
+          ])
+          if err==null{
+          . = merge(., _grk, deep: true)
+          }
+        }
+        # if includes(["605004","605005"], ._temp_.cisco.message_id) {
+        #   _grk , err = parse_groks(.message,[
+        #     "Login %{DATA} from %{IP:source.address}/%{NUMBER:source.port} to %{WORD:_temp_.cisco.destination_interface}:%{IP:destination.address}/%{WORD:network.protocol} for user \\"%{USERNAME:source.user.name}\\"",
+        #     "%{GREEDYDATA:_unparsed_data}"
+        #   ])
+        #   if err==null{
+        #   . = merge(., _grk, deep: true)
+        #   }
+        # }
+
+ 
+        if exists(.network_direction) {.network.direction = del(.network_direction) }
+        if exists(.network_transport) {.network.transport = del(.network_transport) }
+        if exists(.network_protocol) {.network.protocol = del(.network_protocol) }
+        if exists(.source_address) {.source.address = del(.source_address) }
+        if exists(.source_port) {.source.port = del(.source_port) }
+        if exists(.destination_address) {.destination.address = del(.destination_address) }
+        if exists(.event_reason) {.event.reason = del(.event_reason) }
+        if exists(.destination_port) {.destination.port = del(.destination_port) }
+        if exists(._temp_cisco_source_interface) {._temp_.cisco.source_interface = del(._temp_cisco_source_interface) }
+        if exists(._temp_cisco_destination_interface) {._temp_.cisco.destination_interface = del(._temp_cisco_destination_interface) }
+        if exists(._temp_cisco_list_id) {._temp_.cisco.list_id = del(._temp_cisco_list_id) }
+        if exists(._temp_cisco_icmp_type) {._temp_.cisco.icmp_type = del(._temp_cisco_icmp_type) }
+        if exists(.fragment_size) {.fragment.size = del(.fragment_size) }
+        if exists(.fragment_offset) {.fragment.offset = del(.fragment_offset) }
+        if exists(._temp_outcome) {._temp_.outcome = del(._temp_outcome) }
+
+
+      ##tags
+      .tags = []
+      if exists(.tags){
+        .tags = push(.tags, ._unparsed_data)
+      }
+sinks:
+  my_sink:
+    type: "console"
+    inputs: ["my_transform_id"]
+    encoding:
+      codec: "json"
